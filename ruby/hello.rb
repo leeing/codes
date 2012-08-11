@@ -1,3 +1,3 @@
 #!/usr/bin/ruby
 
-puts "no password!";
+puts "Why I have to input the password!";
