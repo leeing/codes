@@ -16,3 +16,4 @@ def foo():
 
 if __name__ == "__main__":
     foo()
+    print("it's a sample file")
