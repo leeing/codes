@@ -1,0 +1,189 @@
+#!/usr/bin/python
+
+__author__ = "leeing@cmbchina.com"
+__date__   = "2013-10-18"
+
+import commands
+import logging
+import logging.config
+import string
+import re
+import os
+import glob
+import shutil
+import zlib
+import math
+import random
+import timeit
+import sys
+import threading
+from ftplib import FTP
+from optparse import OptionParser
+from datetime import datetime, date, time
+
+# Global variables
+PACK=11.0
+SCRIPT_TIME_OUT = 5
+ITIME = 299
+OTIME = 300
+SCRIPT_DIR = os.getcwd()
+LOG_DIR = SCRIPT_DIR + "/log"
+DATA_DIR = SCRIPT_DIR + "/data"
+RAW_DATA_DIR = DATA_DIR + "/raw"
+BAK_DATA_DIR = DATA_DIR + "/bak"
+FTP_SERVER = "76_nim_master"
+SPATH="/opsw/Server/@Group/Public/System/AIX/@"
+
+class RoshScript(threading.Thread):
+    def __init__(self,sa_name,script):
+	threading.Thread.__init__(self,name="["+sa_name+"-" + script+"-thread]")
+	self.sa_name= sa_name
+	self.script = script
+
+    def run(self):
+	wait_time = random.randrange(1,5)
+	logging.debug("## [ogfs] rosh -l root -n " + self.sa_name + " -s ./" + self.script + ", runnning :" + str(wait_time))
+	#todo
+	os.system("sleep " + str(wait_time))
+	logging.debug(self.getName() + " is finished in " + str(wait_time) + "s")
+
+def dispatch_script(sa_list,script):
+    sa_count = len(sa_list)
+    turns = int(math.ceil(sa_count/PACK))
+    logging.info(str(int(PACK)) + " LPARs are going to run scripts concurrently.")
+    logging.info(str(sa_count) + " LPARs are divided into " + str(turns) + " parts to run scripts. ")
+
+    for turn in range(0,turns):
+	start = timeit.default_timer()
+	threads = []
+        logging.info("Dispatch " + script + " to [" + str(turn*int(PACK)) + "-" + str((turn+1)*int(PACK)-1) + "] lpars")
+	for count in range(int(turn*PACK),int((turn+1)*PACK)):
+	    if count < sa_count:
+		logging.debug("The sa counter is :" + str(count))
+		thread = RoshScript(sa_list[count],script)
+		thread.start()
+		threads.append(thread)
+
+	for thread in threads:
+	    thread.join(SCRIPT_TIME_OUT)
+	end = timeit.default_timer()
+	logging.info("Part "+ str(turn+1) + " finished in " + str(end - start) + " seconds")
+
+def process(sa_name,script):
+    #cmd = "rosh -l root -n " + sa_name + " -w 2 -W 3 \"uname\""
+    #if commands.getstatusoutput(cmd) !=0:
+        #record to rosh error log
+#	return 	
+    cmd = "rosh -l root -n " + sa_name + " -w " + str(ITIME) + " -W " + str(OTIME) + " -d /tmp -s " + script
+    logging.debug("cmd is : " + cmd)
+
+    result = commands.getoutput(cmd)
+    logging.debug("result is " + result)
+
+    errpt_files = get_lpar_file_list(sa_name,"/tmp","*.aix_errpt.log")
+    raw_errpt_files = get_lpar_file_list(sa_name,"/tmp","*.aix_errpt.raw.log")
+
+    cp_to_ogfs(errpt_files+raw_errpt_files,RAW_DATA_DIR)
+
+def get_lpar_file_list(sa_name,lpar_path,file_format):
+    file_path_format = "/opsw/Server/@/" + sa_name + "/files/root" + remote + "/" + file_format
+    file_list = glob.glob(file_path_format)
+    return file_list
+
+def cp_to_ogfs(lpar_file_list,ogfs_path):
+    logging.debug("files to copy are " + str(lpar_file_list))
+
+    for file in lpar_file_list:
+	if os.path.exists(file):
+	    shutil.copy(file , ogfs_path + "/" + os.path.basename(file))
+
+def get_sa_list(datacenter="all"):
+    sa_list = os.listdir(SPATH)
+
+    if datacenter == "all":
+	return sa_list
+    elif datacenter == "sh":
+	return [ sa for sa in sa_list if sa.startswith('sh.') ]
+    else:
+	return [ sa for sa in sa_list if not sa.startswith('sh.')]
+
+# archive aix_errpt.csv and aix_errpt.raw.log to .tar.gz
+def archive_files(file_list):
+    dateformat = time.strftime('%Y%m%d%H%M',time.localtime(time.time()))
+    for file in file_list:
+	filename = os.path.basename(file)
+	newfilename = dateformat + "_" + filename
+	tarfile = tarfile.open(RAW_DATA_DIR +"/" + newfilename + ".tar.gz","w:gz")
+	tarfile.add(file)
+	tarfile.close()
+	
+def upload_files(file_list,ftp_server):
+    ftp = FTP(ftp_server)
+    logging.debug("login to FTP server : " + ftp_server)
+    ftp.login("ho198642","password")
+    for file in file_list:
+	fp = open(file,'rb')
+	ftp.storbinary("STOR " + file,fp)
+    ftp.quit()
+    
+def main():
+    parser = OptionParser()
+    parser.add_option("-m","--mode",dest="mode",help="[check|normal] specify the running mode.",default="normal",
+        choices=["check","normal"])
+    parser.add_option("-l","--log_level",dest="log_level",help="[debug|info|warn|error] specify the Logging level.",
+        default="debug",choices=["debug","info","warn","error"])
+    parser.add_option("-s","--mac_list",dest="mac_list",help="specify the LPARs to check,separated by comma")
+
+    (options, args) = parser.parse_args()
+
+    MODE=options.mode
+    mac_list=options.mac_list
+    #init logger
+    if MODE == "check":
+        FORMAT = "%(message)s"
+    else:
+        FORMAT = "[%(levelname)s] %(message)s"
+
+    logger = logging.getLogger()
+
+    logging_level_map = {"info":logging.INFO,"warn":logging.WARN,"error":logging.ERROR,"debug":logging.DEBUG}
+    logger.setLevel(logging_level_map[options.log_level])
+    
+    logging.basicConfig(format=FORMAT)
+
+    logging.debug("SCRIPT_DIR is " + SCRIPT_DIR)
+    logging.debug("LOG_DIR is " + LOG_DIR)
+
+    #precheck
+
+    if not os.path.exists(LOG_DIR):
+	logging.debug("PATH " + LOG_DIR + " does not exist, create it now.")
+	os.makedirs(LOG_DIR)
+
+    if not os.path.exists(DATA_DIR):
+	logging.debug("PATH " + DATA_DIR + " does not exist, create it now.")
+	os.makedirs(DATA_DIR)
+	os.makedirs(RAW_DATA_DIR)
+	os.makedirs(BAK_DATA_DIR)
+
+    # get sa_list
+    sa_list = ['tdauto1','tdauto2','dsapp1','dsapp2','dssapp1','dssapp2','sh.dxdb01','sh.dxdb02','tduat','tdst']
+
+    start = timeit.default_timer()
+    dispatch_script(sa_list,"chkaix.py")
+    end = timeit.default_timer()
+    logging.info("the script is finished in " + str(end-start) + " seconds")
+
+    # when all the rosh commands finished, contentate the log files to csv and raw.csv
+
+    # zip the file to tar.gz
+
+    # upload the files to FTP server
+
+    # move data from raw to bak
+
+    logging.shutdown()
+    
+if __name__ == "__main__":
+    main()
+
